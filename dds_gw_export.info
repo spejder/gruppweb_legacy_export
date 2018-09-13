@@ -1,0 +1,9 @@
+name        = Gruppeweb export
+description = Various exports from gruppeweb
+package     = Det Danske Spejderkorps
+core        = 6.x
+
+
+version = "6.x-1.0"
+core = "6.x"
+project = "dds"

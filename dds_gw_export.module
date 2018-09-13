@@ -1,0 +1,450 @@
+<?php
+/**
+ * @file
+ * Export functionallity for Gruppeweb 1.0.
+ */
+
+/**
+ * Constants for the various URL-paths that will trigger an export.
+ */
+define('DDS_GW_EXPORT_GALLERY_PATH', 'hent');
+define('DDS_GW_EXPORT_GALLERYLIST_PATH', 'hent');
+define('DDS_GW_EXPORT_FILES_PATH', 'hent-filer');
+
+/**
+ * Implements hook_menu().
+ */
+function dds_gw_export_menu() {
+  $items = array();
+
+  // Export of a single gallery.
+  $items['galleri/%/' . DDS_GW_EXPORT_GALLERY_PATH] = array(
+    'title' => 'Eksporter galleri',
+    'page callback' => 'dds_gw_export_stream_gallery',
+    'page arguments' => array(1),
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 1,
+    'description' => '',
+    'access arguments' => array('upload files'),
+  );
+
+  // Export of nodes attached to a single node. Visible as the local task
+  // menu for a node view.
+  $items['node/%node/' . DDS_GW_EXPORT_FILES_PATH] = array(
+    'title' => 'Eksporter alle filer',
+    'page callback' => 'dds_gw_export_download_attached_files',
+    'page arguments' => array(1),
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 1,
+    'description' => '',
+    'access callback' => 'dds_gw_export_attached_files_access',
+  );
+
+  // Export of all galleries
+  $items['gallerilist/all/' . DDS_GW_EXPORT_GALLERYLIST_PATH] = array(
+    'title' => 'Download gallery',
+    'page callback' => 'dds_gw_export_stream_gallery',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 1,
+    'description' => '',
+    'access arguments' => array('upload files'),
+  );
+
+  // The admin-page.
+  $items['admin/settings/gruppeweb_eksport'] = array(
+    'title' => 'DDS Gruppeweb Eksport',
+    'description' => 'Funktionalitet til at downloade billeder og filer fra gruppeweb samlet',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('dds_gw_export_admin_form'),
+    'access arguments' => array('edit any page content'),
+    'file' => 'dds_gw_export.admin.inc',
+
+  );
+
+  return $items;
+}
+
+
+/**
+ * Load a single gallery and return its term and images.
+ *
+ * @param $tid
+ *   Taxonomy id.
+ *
+ * @return array
+ *   An (term => loaded term, images => image data) array.
+ */
+function _dds_gw_export_load_gallery($tid) {
+  // Get all files associated with the gallery (galleries are taxonomy terms).
+  $result = db_query(' 
+    select n.title as title, f.filepath as path, f.fid as fid from term_data td 
+    join term_node tn on td.tid = tn.tid 
+    join node n on tn.nid = n.nid 
+    join image i on i.nid = n.nid 
+    join files f on i.fid = f.fid where td.tid = %d and i.image_size = "_original" and td.vid = %d',
+    $tid,
+    _dds_gw_gallery_get_vid()
+  );
+
+  $images = array();
+  while ($data = db_fetch_array($result)) {
+    $images[] = $data;
+  }
+
+  return array(
+    'term' => taxonomy_get_term($tid),
+    'images' => $images,
+  );
+}
+
+
+/**
+ * Generate an exportable list of files in a gallery.
+ *
+ * @param array $gallery
+ *   Gallery loaded via _dds_gw_export_load_gallery()
+ *
+ * @return array
+ *   list of (source => .. , destination => .. ) array for export.
+ */
+function _dds_gw_export_gallery_to_file_list($gallery) {
+  $file_list = array();
+  $term = $gallery['term'];
+  $gallery_directory = _dds_gw_export_simplify_name($term->name);
+  foreach ($gallery['images'] as $image) {
+    $image_basename = basename($image['path']);
+    $server_file_path = getcwd() . '/' . $image['path'];
+    $zip_file_path = $gallery_directory . '/' . $image_basename;
+    $file_list[] = array(
+      'source' => $server_file_path,
+      'destination' => $zip_file_path,
+    );
+  }
+
+  return $file_list;
+}
+
+/**
+ * Translate tricky path chars into something that is safe.
+ */
+function _dds_gw_export_simplify_name($name) {
+  $name = preg_replace('/\s/','-', $name);
+  mb_internal_encoding('UTF-8');
+  return preg_replace('/[^\wæøåA-ZÆØÅ0-9\._]/u','', $name);
+}
+
+/**
+ * Zips a list of files and streams the result to the user.
+ *
+ * @param $user_filename
+ *   The filename we should present in the download.
+ *
+ * @param $file_list
+ *   List of (source => .., destination => ..) file entries.
+ */
+function dds_gw_zip_and_stream($user_filename, $file_list) {
+  $time_start = microtime(TRUE);
+  $zip_file = _dds_gw_zip($file_list);
+  $time_end = microtime(TRUE);
+  watchdog(
+    'dds_gw_export',
+    'Produced zip-file in ' . round($time_end - $time_start, 2) . ' seconds'
+  );
+
+  $stream_start = microtime(TRUE);
+
+  // Stream the result to the user.
+  _dds_gw_export_stream_file($zip_file, $user_filename);
+  $stream_end = microtime(TRUE);
+
+  watchdog(
+    'dds_gw_export',
+    'Streamed zip-file in ' . round($stream_end - $stream_start, 2) . ' seconds'
+  );
+
+  // Delete the file
+  unlink($zip_file);
+  exit();
+}
+
+
+/**
+ * Zip a list of files
+ *
+ * @param $file_list
+ *  List of (source => .., destination => ..) file entries.
+ *
+ * @return string
+ *   Full path and name of the file.
+ */
+function _dds_gw_zip($file_list) {
+  // We allow this to take up to 5 minutes - yes, it's a bad idea.
+  set_time_limit(60 * 5);
+  // TODO - error-handling.
+  // TODO - better base name.
+  $zip = new ZipArchive();
+  // TODO - really??
+  $filename = tempnam('/tmp', 'gw-export');
+
+  if ($zip->open($filename, ZipArchive::CREATE) !== TRUE) {
+    exit("cannot open <$filename>\n");
+  }
+
+  foreach ($file_list as $file) {
+    if (!$zip->addFile($file['source'], $file['destination'])) {
+      watchdog('dds_gw_export', 'Could not add the file ' . $file['source']);
+    }
+  }
+
+  $zip->close();
+
+  return $filename;
+}
+
+/**
+ * Get the ID of the vocabulary used for galleries.
+ */
+function _dds_gw_gallery_get_vid() {
+  return variable_get('image_gallery_nav_vocabulary', NULL);
+}
+
+/**
+ * Generate list of all gallery taxonomy ids.
+ *
+ * @return array
+ *   List of tids.
+ */
+function _dds_gw_load_all_gallery_tids() {
+  $result = db_query(
+    'select tid from term_data where vid = %d',
+    _dds_gw_gallery_get_vid()
+  );
+  while ($data = db_fetch_array($result)) {
+    $tids[] = $data['tid'];
+  }
+
+  return $tids;
+}
+
+/**
+ * Download a single gallery.
+ *
+ * @param string $tid
+ *   Taxonomy ID of the gallery. If omitted all galleries are downloaded.
+ */
+function dds_gw_export_stream_gallery($tid = '') {
+  $tids = array();
+  if (!empty($tid)) {
+    $tids = array($tid);
+  }
+  else {
+    $tids = _dds_gw_load_all_gallery_tids();
+  }
+  $file_list = array();
+
+  foreach ($tids as $gallery_tid) {
+    $gallery = _dds_gw_export_load_gallery($gallery_tid);
+    $file_list = array_merge(
+      $file_list,
+      _dds_gw_export_gallery_to_file_list($gallery)
+    );
+  }
+
+  if (empty($file_list)) {
+    drupal_not_found();
+    exit;
+  }
+
+  watchdog(
+    'dds_gw_export',
+    'exporting galleries with tid ' . implode(', ', $tids)
+  );
+  if (empty($tid)) {
+    $user_filename = 'alle-gallerier.zip';
+  }
+  else {
+    $term = taxonomy_get_term($tid);
+    $user_filename = 'gallery-' . $tid . '-' . _dds_gw_export_simplify_name($term->name) . '.zip';
+  }
+
+  dds_gw_zip_and_stream($user_filename, $file_list);
+}
+
+/**
+ * Produce a list of all attached files on the site.
+ *
+ * @return array
+ *   A
+ */
+function _dds_gw_export_all_files() {
+  $result = db_query(
+    ' 
+    select n.title directory, f.filepath filepath 
+    from node n
+    join upload u on u.vid = n.vid
+    join files f  on u.fid = f.fid
+    '
+  );
+  while ($data = db_fetch_array($result)) {
+    $file_list[] = _dds_gw_export_prepare_file_entry($data);
+  }
+
+  return $file_list;
+}
+
+function _dds_gw_export_attached_files($nid) {
+  $result = db_query(
+    ' 
+    select n.title directory, f.filepath filepath 
+    from node n
+    join upload u on u.vid = n.vid
+    join files f  on u.fid = f.fid
+    WHERE n.nid = %d
+    ',
+    $nid
+  );
+  while ($data = db_fetch_array($result)) {
+    $file_list[] = _dds_gw_export_prepare_file_entry($data);
+  }
+
+  return $file_list;
+}
+
+function _dds_gw_get_all_nodes_with_attachments() {
+  $nodes = array();
+  $result = db_query(
+    ' 
+    select n.nid as nid, count(f.fid) as count_files 
+    from node n
+    join upload u on u.vid = n.vid
+    join files f  on u.fid = f.fid group by n.nid
+    '
+  );
+  while ($data = db_fetch_array($result)) {
+    $nodes[] = array(
+      'node' => node_load($data['nid']),
+      'count' => $data['count_files'],
+    );
+  }
+
+  return $nodes;
+}
+
+/**
+ * Prepares a single (filepath => ... directory => ...) entry for zip export.
+ */
+function _dds_gw_export_prepare_file_entry($entry) {
+  $directory = _dds_gw_export_simplify_name($entry['directory']);
+  $filename = basename($entry['filepath']);
+  $server_file_path = getcwd() . '/' . $entry['filepath'];
+  $zip_file_path = $directory . '/' . _dds_gw_export_simplify_name($filename);
+  return array(
+    'source' => $server_file_path,
+    'destination' => $zip_file_path,
+  );
+}
+
+function _dds_gw_export_stream_file($path, $visible_name) {
+  set_time_limit(60 * 20);
+  if (ob_get_level()) {
+    ob_end_clean();
+  }
+
+  // IE cannot download private files because it cannot store files downloaded
+  // over HTTPS in the browser cache. The problem can be solved by sending
+  // custom headers to IE. See http://support.microsoft.com/kb/323308/en-us
+  if (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on') {
+    drupal_set_header('Cache-Control: private');
+    drupal_set_header('Pragma: private');
+  }
+  drupal_set_header('Content-Length: ' . filesize($path));
+  drupal_set_header("Content-Disposition: attachment; filename=$visible_name;");
+  drupal_set_header("Content-Type: application/zip");
+
+  watchdog('dds_gw_export', 'Streaming ' . $path);
+  // Transfer file in 1024 byte chunks to save memory usage.
+  if ($fd = fopen($path, 'r')) {
+    while (!feof($fd)) {
+      print fread($fd, 1024 * 1024);
+    }
+    fclose($fd);
+  }
+}
+
+/**
+ * Submithandler for the admin-form that streams all galleries to the user.
+ */
+function dds_gw_export_download_galleries_submit($form, &$form_state) {
+  // Stream all (don't pass any arguments).
+  dds_gw_export_stream_gallery();
+}
+
+/**
+ * Submit-handler for the admin-form that streams all files to the user.
+ */
+function dds_gw_export_download_files_submit($form, &$form_state) {
+  $file_list = _dds_gw_export_all_files();
+  watchdog('dds_gw_export', "Exporting " . count($file_list) . ' files');
+  dds_gw_zip_and_stream('gruppeweb-alle-filer.zip', $file_list);
+}
+
+/**
+ * Page callback that downloads all files attached to a node.
+ *
+ * @param $node
+ *   The node to get attachments from.
+ */
+function dds_gw_export_download_attached_files($node) {
+  $file_list = _dds_gw_export_attached_files($node->nid);
+  watchdog('dds_gw_export', "Exporting " . count($file_list) . ' files');
+  dds_gw_zip_and_stream(
+    _dds_gw_export_simplify_name(
+      $node->nid . '-' . $node->title
+    ) . '-filer.zip',
+    $file_list
+  );
+}
+
+/**
+ * Preprocess hook that adds a "download as archive" link to gallery terms.
+ */
+function dds_gw_export_preprocess_image_gallery_view_image_gallery_terms(&$vars) {
+  if (!user_access('upload files')) {
+    return;
+  }
+
+  foreach ($vars['rows'] as $rowNo => &$row) {
+    $row .= l('Hent galleri som arkiv', 'galleri/' . $vars['view']->result[$rowNo]->tid . '/' . DDS_GW_EXPORT_GALLERY_PATH);
+  }
+}
+
+/**
+ * Check that the user is permitted to download files and that the node has them.
+ * @return bool
+ */
+function dds_gw_export_attached_files_access() {
+  if (!user_access('upload files')) {
+    return false;
+  }
+
+  $node = node_load(arg(1));
+  $files = _dds_gw_export_attached_files($node->nid);
+  if (empty($files)) {
+    return false;
+  } else {
+    return true;
+  }
+}
+
+/**
+ * Preproccess hook that attaches a download link to galleries.
+ */
+function dds_gw_export_preprocess_views_view(&$vars) {
+  $view = $vars['view'];
+  if ($view->name !== 'imagesgallery') {
+    return;
+  }
+
+  $termId = $view->args[0];
+  $vars['rows'] .= '<br>' .  l('Hent galleri som arkiv', 'galleri/' . $termId . '/' . DDS_GW_EXPORT_GALLERY_PATH);
+}
